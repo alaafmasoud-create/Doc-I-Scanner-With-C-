@@ -1,0 +1,6 @@
+build-essential
+cmake
+ninja-build
+python3-dev
+pkg-config
+libopencv-dev

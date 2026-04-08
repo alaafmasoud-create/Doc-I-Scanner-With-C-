@@ -1,0 +1,23 @@
+[build-system]
+requires = [
+  "scikit-build-core>=0.10",
+  "pybind11>=2.13"
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "docscanner-cpp-streamlit"
+version = "0.1.0"
+description = "Hybrid Streamlit + C++ A4 document scanner"
+requires-python = ">=3.11"
+dependencies = [
+  "streamlit>=1.44",
+  "numpy>=1.26",
+  "opencv-python-headless>=4.10",
+  "streamlit-image-coordinates>=0.1.9"
+]
+
+[tool.scikit-build]
+cmake.minimum-version = "3.18"
+build-dir = "build/{wheel_tag}"
+wheel.packages = []
