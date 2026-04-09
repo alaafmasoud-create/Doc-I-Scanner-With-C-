@@ -3,16 +3,296 @@ import cv2
 import numpy as np
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-try:
-    import docscanner_cpp
-    CPP_IMPORT_ERROR = None
-except Exception as e:
-    docscanner_cpp = None
-    CPP_IMPORT_ERROR = e
+
+# -----------------------------
+# Geometry helpers
+# -----------------------------
+def order_points(pts):
+    pts = np.array(pts, dtype=np.float32)
+    rect = np.zeros((4, 2), dtype=np.float32)
+
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]   # top-left
+    rect[2] = pts[np.argmax(s)]   # bottom-right
+
+    diff = np.diff(pts, axis=1).reshape(-1)
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
+
+    return rect
+
+
+def four_point_transform(image, pts):
+    rect = order_points(pts)
+    tl, tr, br, bl = rect
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    max_width = max(int(width_a), int(width_b), 1)
+
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_height = max(int(height_a), int(height_b), 1)
+
+    dst = np.array([
+        [0, 0],
+        [max_width - 1, 0],
+        [max_width - 1, max_height - 1],
+        [0, max_height - 1]
+    ], dtype=np.float32)
+
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, M, (max_width, max_height))
+    return warped
+
+
+def expand_quad(pts, scale, img_shape):
+    pts = np.array(pts, dtype=np.float32)
+    center = pts.mean(axis=0)
+    expanded = center + (pts - center) * scale
+
+    h, w = img_shape[:2]
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, w - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, h - 1)
+
+    return expanded.astype(np.float32)
+
+
+def contour_to_quad(contour):
+    hull = cv2.convexHull(contour)
+    peri = cv2.arcLength(hull, True)
+
+    for eps in [0.02, 0.03, 0.04, 0.05, 0.06]:
+        approx = cv2.approxPolyDP(hull, eps * peri, True)
+        if len(approx) == 4:
+            return approx.reshape(4, 2).astype(np.float32)
+
+    rect = cv2.minAreaRect(hull)
+    box = cv2.boxPoints(rect)
+    return box.astype(np.float32)
 
 
 # -----------------------------
-# Python-side helpers (UI / I/O)
+# Mask helpers
+# -----------------------------
+def clear_border_connected(mask):
+    cleaned = mask.copy()
+    h, w = cleaned.shape
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+
+    for x in range(w):
+        if cleaned[0, x] == 255:
+            cv2.floodFill(cleaned, flood_mask, (x, 0), 0)
+        if cleaned[h - 1, x] == 255:
+            cv2.floodFill(cleaned, flood_mask, (x, h - 1), 0)
+
+    for y in range(h):
+        if cleaned[y, 0] == 255:
+            cv2.floodFill(cleaned, flood_mask, (0, y), 0)
+        if cleaned[y, w - 1] == 255:
+            cv2.floodFill(cleaned, flood_mask, (w - 1, y), 0)
+
+    return cleaned
+
+
+def largest_non_border_component(binary_mask, min_area_ratio=0.05):
+    h, w = binary_mask.shape
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_mask, 8)
+
+    best_idx = None
+    best_area = 0
+    min_area = min_area_ratio * h * w
+
+    for i in range(1, num_labels):
+        x, y, ww, hh, area = stats[i]
+
+        if area < min_area:
+            continue
+
+        if x <= 1 or y <= 1 or x + ww >= w - 1 or y + hh >= h - 1:
+            continue
+
+        if area > best_area:
+            best_area = area
+            best_idx = i
+
+    if best_idx is None:
+        return None
+
+    comp = np.zeros_like(binary_mask)
+    comp[labels == best_idx] = 255
+    return comp
+
+
+def build_candidate_masks(image):
+    masks = []
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray_eq = clahe.apply(gray)
+
+    h, w = gray.shape
+
+    # GrabCut
+    try:
+        gc_mask = np.zeros((h, w), np.uint8)
+        rect = (int(w * 0.06), int(h * 0.04), int(w * 0.88), int(h * 0.92))
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+
+        cv2.grabCut(image, gc_mask, rect, bgd_model, fgd_model, 4, cv2.GC_INIT_WITH_RECT)
+
+        grabcut = np.where(
+            (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
+            255,
+            0
+        ).astype(np.uint8)
+
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        grabcut = cv2.morphologyEx(grabcut, cv2.MORPH_CLOSE, k, iterations=2)
+        masks.append(("grabcut", grabcut))
+    except Exception:
+        pass
+
+    # Bright paper mask
+    _, bright = cv2.threshold(gray_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bright = clear_border_connected(bright)
+
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    bright = cv2.erode(bright, k, iterations=2)
+
+    comp = largest_non_border_component(bright, min_area_ratio=0.05)
+    if comp is not None:
+        comp = cv2.dilate(comp, k, iterations=2)
+        comp = cv2.morphologyEx(comp, cv2.MORPH_CLOSE, k, iterations=2)
+        masks.append(("bright", comp))
+
+    # Edges
+    edges = cv2.Canny(gray, 40, 140)
+    k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edges = cv2.dilate(edges, k2, iterations=2)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k2, iterations=2)
+    masks.append(("edges", edges))
+
+    return masks
+
+
+# -----------------------------
+# Candidate scoring
+# -----------------------------
+def score_candidate(quad, img_shape, contour_area):
+    h, w = img_shape[:2]
+    rect = order_points(quad)
+    tl, tr, br, bl = rect
+
+    width = max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl))
+    height = max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))
+
+    if width < 100 or height < 100:
+        return -1e9
+
+    box_area = cv2.contourArea(rect.reshape(-1, 1, 2))
+    if box_area <= 1:
+        return -1e9
+
+    area_ratio = box_area / (h * w)
+    if area_ratio < 0.20 or area_ratio > 0.98:
+        return -1e9
+
+    aspect = max(width, height) / max(1.0, min(width, height))
+    a4_ratio = 1.414
+    aspect_score = max(0.0, 1.0 - abs(aspect - a4_ratio) / 0.8)
+
+    center = rect.mean(axis=0)
+    img_center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+    center_dist = np.linalg.norm(center - img_center) / np.linalg.norm(img_center)
+    center_score = max(0.0, 1.0 - center_dist)
+
+    fill_ratio = float(np.clip(contour_area / box_area, 0.0, 1.2))
+
+    margin = min(
+        rect[:, 0].min(),
+        rect[:, 1].min(),
+        (w - 1) - rect[:, 0].max(),
+        (h - 1) - rect[:, 1].max(),
+    )
+    margin_score = float(np.clip((margin + 20) / 120.0, 0.0, 1.0))
+
+    score = (
+        area_ratio * 95.0
+        + aspect_score * 22.0
+        + center_score * 8.0
+        + margin_score * 4.0
+        + fill_ratio * 40.0
+    )
+
+    return score
+
+
+# -----------------------------
+# Auto detection
+# -----------------------------
+def detect_document_auto(original):
+    if original.shape[0] > 1400:
+        resize_ratio = original.shape[0] / 1400.0
+        image = cv2.resize(original, (int(original.shape[1] / resize_ratio), 1400))
+    else:
+        resize_ratio = 1.0
+        image = original.copy()
+
+    masks = build_candidate_masks(image)
+
+    best_quad = None
+    best_score = -1e9
+    best_source = None
+    best_fill_ratio = 1.0
+
+    img_area = image.shape[0] * image.shape[1]
+
+    for source_name, candidate_mask in masks:
+        contours = cv2.findContours(
+            candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        contours = contours[0] if len(contours) == 2 else contours[1]
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:12]
+
+        for c in contours:
+            contour_area = cv2.contourArea(c)
+            if contour_area < 0.05 * img_area:
+                continue
+
+            quad = contour_to_quad(c)
+            score = score_candidate(quad, image.shape, contour_area)
+
+            if score > best_score:
+                box_area = cv2.contourArea(order_points(quad).reshape(-1, 1, 2))
+                fill_ratio = float(np.clip(contour_area / max(box_area, 1.0), 0.0, 1.2))
+
+                best_score = score
+                best_quad = quad
+                best_source = source_name
+                best_fill_ratio = min(fill_ratio, 1.0)
+
+    if best_quad is None:
+        raise ValueError("Could not detect the document correctly.")
+
+    best_quad = best_quad * resize_ratio
+
+    expansion = 1.0 + 0.55 * (1.0 - best_fill_ratio)
+    if best_source == "edges":
+        expansion += 0.02
+
+    expansion = float(np.clip(expansion, 1.00, 1.18))
+    best_quad = expand_quad(best_quad, expansion, original.shape)
+
+    warped = four_point_transform(original, best_quad)
+    warped = trim_black_frame(warped)
+    return warped
+
+
+# -----------------------------
+# Manual mode helpers
 # -----------------------------
 def make_preview_for_clicks(image, max_width=1000, max_height=1400):
     h, w = image.shape[:2]
@@ -37,20 +317,42 @@ def draw_points_on_preview(preview_rgb, points_preview, radius=8):
             0.8,
             (255, 0, 0),
             2,
-            cv2.LINE_AA,
+            cv2.LINE_AA
         )
     return canvas
+
+
+def detect_document_manual(original, points_original):
+    pts = np.array(points_original, dtype=np.float32)
+    warped = four_point_transform(original, pts)
+    warped = trim_black_frame(warped)
+    return warped
+
+
+# -----------------------------
+# Post-processing
+# -----------------------------
+def trim_black_frame(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, 6, 255, cv2.THRESH_BINARY)
+    coords = cv2.findNonZero(mask)
+
+    if coords is None:
+        return image
+
+    x, y, w, h = cv2.boundingRect(coords)
+    return image[y:y + h, x:x + w]
 
 
 def decode_uploaded_image(file_bytes):
     file_array = np.asarray(bytearray(file_bytes), dtype=np.uint8)
     img = cv2.imdecode(file_array, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError("No se pudo leer la imagen subida.")
+        raise ValueError("Could not read the uploaded image.")
     return img
 
 
-def image_to_download_bytes(image_bgr):
+def image_to_download_bytes(image_bgr, filename="final_result.png"):
     success, buffer = cv2.imencode(".png", image_bgr)
     if not success:
         return None
@@ -60,10 +362,9 @@ def image_to_download_bytes(image_bgr):
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="Escáner de Documentos A4", page_icon="📄", layout="wide")
+st.set_page_config(page_title="A4 Document Scanner", page_icon="📄", layout="wide")
 
-st.markdown(
-    """
+st.markdown("""
 <style>
     .stApp {
         background: linear-gradient(180deg, #f8fafc 0%, #eef4ff 100%);
@@ -244,44 +545,30 @@ st.markdown(
         border: 1px solid #93c5fd;
     }
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-st.markdown(
-    """
+st.markdown("""
 <div class="hero-box">
-    <div class="hero-title">📄 Escáner de Documentos A4</div>
+    <div class="hero-title">📄 A4 Document Scanner</div>
     <p class="hero-subtitle">
-        Sube una imagen de un documento A4. Usa el modo automático predeterminado o ajusta manualmente las esquinas para un recorte más preciso.
+        Upload an image of an A4 document. Use the default automatic mode or manually adjust the corners for a more accurate crop.
     </p>
 </div>
-""",
-    unsafe_allow_html=True,
-)
-
-if CPP_IMPORT_ERROR is not None:
-    st.error("No se pudo cargar el módulo C++ (docscanner_cpp).")
-    st.code(str(CPP_IMPORT_ERROR))
-    st.info(
-        "Comprueba que el despliegue haya instalado requirements.txt y packages.txt, "
-        "y que el módulo haya compilado correctamente durante el build."
-    )
-    st.stop()
+""", unsafe_allow_html=True)
 
 st.markdown('<div class="section-card">', unsafe_allow_html=True)
-st.markdown('<div class="section-title">Configuración del escáner</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-note">Elige el modo y sube una o varias imágenes.</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Scanner Settings</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-note">Choose the mode and upload one or more images.</div>', unsafe_allow_html=True)
 
-mode = st.radio("Modo", ["Automático", "Manual"], horizontal=True)
+mode = st.radio("Mode", ["Automatic", "Manual"], horizontal=True)
 
 uploaded_files = st.file_uploader(
-    "Subir imagen",
+    "Upload image",
     type=["jpg", "jpeg", "png", "bmp", "webp"],
-    accept_multiple_files=True,
+    accept_multiple_files=True
 )
 
-st.markdown("</div>", unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
 
 if "manual_points_preview" not in st.session_state:
     st.session_state.manual_points_preview = []
@@ -296,48 +583,51 @@ if "last_uploaded_key" not in st.session_state:
     st.session_state.last_uploaded_key = None
 
 if uploaded_files:
-    if mode == "Automático":
+    if mode == "Automatic":
         for file_index, uploaded_file in enumerate(uploaded_files):
             st.markdown('<div class="section-card">', unsafe_allow_html=True)
-            st.markdown('<div class="result-label">RESULTADO AUTOMÁTICO</div>', unsafe_allow_html=True)
+            st.markdown('<div class="result-label">AUTOMATIC RESULT</div>', unsafe_allow_html=True)
             st.subheader(f"{uploaded_file.name}")
 
             file_bytes = uploaded_file.getvalue()
             original = decode_uploaded_image(file_bytes)
 
             try:
-                result = docscanner_cpp.detect_document_auto(original)
+                result = detect_document_auto(original)
                 st.image(
                     cv2.cvtColor(result, cv2.COLOR_BGR2RGB),
-                    caption="Resultado final",
-                    use_container_width=True,
+                    caption="Final result",
+                    use_container_width=True
                 )
 
                 download_bytes = image_to_download_bytes(result)
                 if download_bytes is not None:
                     file_base = uploaded_file.name.rsplit(".", 1)[0]
                     st.download_button(
-                        label="Descargar resultado final",
+                        label="Download final result",
                         data=download_bytes,
                         file_name=f"{file_base}_final_result.png",
                         mime="image/png",
-                        key=f"download_auto_{file_index}",
+                        key=f"download_auto_{file_index}"
                     )
 
             except Exception as e:
                 st.error(f"Error: {e}")
-            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
 
     else:
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="result-label">MODO MANUAL</div>', unsafe_allow_html=True)
+        st.markdown('<div class="result-label">MANUAL MODE</div>', unsafe_allow_html=True)
 
         selected_file_name = st.selectbox(
-            "Selecciona una imagen para el modo manual",
-            [file.name for file in uploaded_files],
+            "Select an image for manual mode",
+            [file.name for file in uploaded_files]
         )
 
-        uploaded_file = next(file for file in uploaded_files if file.name == selected_file_name)
+        uploaded_file = next(
+            file for file in uploaded_files if file.name == selected_file_name
+        )
+
         upload_key = f"{uploaded_file.name}_{uploaded_file.size}"
 
         if st.session_state.last_uploaded_key != upload_key:
@@ -352,24 +642,24 @@ if uploaded_files:
         preview_rgb, preview_scale = make_preview_for_clicks(
             original,
             max_width=1000,
-            max_height=1400,
+            max_height=1400
         )
 
         preview_with_points = draw_points_on_preview(
             preview_rgb,
-            st.session_state.manual_points_preview,
+            st.session_state.manual_points_preview
         )
 
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
-            if st.button("Restablecer puntos"):
+            if st.button("Reset points"):
                 st.session_state.manual_points_preview = []
                 st.session_state.manual_points_original = []
                 st.session_state.last_click = None
                 st.rerun()
 
         with col_btn2:
-            if st.button("Deshacer el último punto"):
+            if st.button("Undo last point"):
                 if st.session_state.manual_points_preview:
                     st.session_state.manual_points_preview.pop()
                 if st.session_state.manual_points_original:
@@ -377,9 +667,12 @@ if uploaded_files:
                 st.session_state.last_click = None
                 st.rerun()
 
-        st.subheader("Haz clic en las 4 esquinas")
+        st.subheader("Click on the 4 corners")
 
-        clicked = streamlit_image_coordinates(preview_with_points, key="manual_click_image")
+        clicked = streamlit_image_coordinates(
+            preview_with_points,
+            key="manual_click_image"
+        )
 
         if clicked is not None:
             current_click = (clicked["x"], clicked["y"])
@@ -401,27 +694,24 @@ if uploaded_files:
 
         if len(st.session_state.manual_points_original) == 4:
             try:
-                points = np.array(st.session_state.manual_points_original, dtype=np.float32)
-                result = docscanner_cpp.detect_document_manual(original, points)
+                result = detect_document_manual(original, st.session_state.manual_points_original)
                 st.image(
                     cv2.cvtColor(result, cv2.COLOR_BGR2RGB),
-                    caption="Resultado manual",
-                    use_container_width=True,
+                    caption="Manual result",
+                    use_container_width=True
                 )
 
                 download_bytes = image_to_download_bytes(result)
                 if download_bytes is not None:
                     file_base = uploaded_file.name.rsplit(".", 1)[0]
                     st.download_button(
-                        label="Descargar resultado final",
+                        label="Download final result",
                         data=download_bytes,
                         file_name=f"{file_base}_final_result.png",
-                        mime="image/png",
+                        mime="image/png"
                     )
 
             except Exception as e:
-                st.error(f"Error: {e}")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
+                st.error(f"Error: {e}")  
 st.markdown('<div class="footer-signature">By Alan Masoud</div>', unsafe_allow_html=True)
+
