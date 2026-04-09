@@ -54,7 +54,7 @@ This approach is technically correct for using C++ inside Streamlit, but the mos
 
 ## Test the app @ streamlit
 
-[Test the code here](https://6955966t4r.streamlit.app/)
+[https://6955966t4r.streamlit.app/](https://6955966t4r.streamlit.app/)
 
 ## Authior
 Built By Alan Masoud
