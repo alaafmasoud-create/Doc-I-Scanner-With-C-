@@ -1,717 +1,463 @@
-import streamlit as st
-import cv2
-import numpy as np
-from streamlit_image_coordinates import streamlit_image_coordinates
-
-
-# -----------------------------
-# Geometry helpers
-# -----------------------------
-def order_points(pts):
-    pts = np.array(pts, dtype=np.float32)
-    rect = np.zeros((4, 2), dtype=np.float32)
-
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]   # top-left
-    rect[2] = pts[np.argmax(s)]   # bottom-right
-
-    diff = np.diff(pts, axis=1).reshape(-1)
-    rect[1] = pts[np.argmin(diff)]  # top-right
-    rect[3] = pts[np.argmax(diff)]  # bottom-left
-
-    return rect
-
-
-def four_point_transform(image, pts):
-    rect = order_points(pts)
-    tl, tr, br, bl = rect
-
-    width_a = np.linalg.norm(br - bl)
-    width_b = np.linalg.norm(tr - tl)
-    max_width = max(int(width_a), int(width_b), 1)
-
-    height_a = np.linalg.norm(tr - br)
-    height_b = np.linalg.norm(tl - bl)
-    max_height = max(int(height_a), int(height_b), 1)
-
-    dst = np.array([
-        [0, 0],
-        [max_width - 1, 0],
-        [max_width - 1, max_height - 1],
-        [0, max_height - 1]
-    ], dtype=np.float32)
-
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (max_width, max_height))
-    return warped
-
-
-def expand_quad(pts, scale, img_shape):
-    pts = np.array(pts, dtype=np.float32)
-    center = pts.mean(axis=0)
-    expanded = center + (pts - center) * scale
-
-    h, w = img_shape[:2]
-    expanded[:, 0] = np.clip(expanded[:, 0], 0, w - 1)
-    expanded[:, 1] = np.clip(expanded[:, 1], 0, h - 1)
-
-    return expanded.astype(np.float32)
-
-
-def contour_to_quad(contour):
-    hull = cv2.convexHull(contour)
-    peri = cv2.arcLength(hull, True)
-
-    for eps in [0.02, 0.03, 0.04, 0.05, 0.06]:
-        approx = cv2.approxPolyDP(hull, eps * peri, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2).astype(np.float32)
-
-    rect = cv2.minAreaRect(hull)
-    box = cv2.boxPoints(rect)
-    return box.astype(np.float32)
-
-
-# -----------------------------
-# Mask helpers
-# -----------------------------
-def clear_border_connected(mask):
-    cleaned = mask.copy()
-    h, w = cleaned.shape
-    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-
-    for x in range(w):
-        if cleaned[0, x] == 255:
-            cv2.floodFill(cleaned, flood_mask, (x, 0), 0)
-        if cleaned[h - 1, x] == 255:
-            cv2.floodFill(cleaned, flood_mask, (x, h - 1), 0)
-
-    for y in range(h):
-        if cleaned[y, 0] == 255:
-            cv2.floodFill(cleaned, flood_mask, (0, y), 0)
-        if cleaned[y, w - 1] == 255:
-            cv2.floodFill(cleaned, flood_mask, (w - 1, y), 0)
-
-    return cleaned
-
-
-def largest_non_border_component(binary_mask, min_area_ratio=0.05):
-    h, w = binary_mask.shape
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_mask, 8)
-
-    best_idx = None
-    best_area = 0
-    min_area = min_area_ratio * h * w
-
-    for i in range(1, num_labels):
-        x, y, ww, hh, area = stats[i]
-
-        if area < min_area:
-            continue
-
-        if x <= 1 or y <= 1 or x + ww >= w - 1 or y + hh >= h - 1:
-            continue
-
-        if area > best_area:
-            best_area = area
-            best_idx = i
-
-    if best_idx is None:
-        return None
-
-    comp = np.zeros_like(binary_mask)
-    comp[labels == best_idx] = 255
-    return comp
-
-
-def build_candidate_masks(image):
-    masks = []
-
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray_eq = clahe.apply(gray)
-
-    h, w = gray.shape
-
-    # GrabCut
-    try:
-        gc_mask = np.zeros((h, w), np.uint8)
-        rect = (int(w * 0.06), int(h * 0.04), int(w * 0.88), int(h * 0.92))
-        bgd_model = np.zeros((1, 65), np.float64)
-        fgd_model = np.zeros((1, 65), np.float64)
-
-        cv2.grabCut(image, gc_mask, rect, bgd_model, fgd_model, 4, cv2.GC_INIT_WITH_RECT)
-
-        grabcut = np.where(
-            (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
-            255,
-            0
-        ).astype(np.uint8)
-
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-        grabcut = cv2.morphologyEx(grabcut, cv2.MORPH_CLOSE, k, iterations=2)
-        masks.append(("grabcut", grabcut))
-    except Exception:
-        pass
-
-    # Bright paper mask
-    _, bright = cv2.threshold(gray_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    bright = clear_border_connected(bright)
-
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    bright = cv2.erode(bright, k, iterations=2)
-
-    comp = largest_non_border_component(bright, min_area_ratio=0.05)
-    if comp is not None:
-        comp = cv2.dilate(comp, k, iterations=2)
-        comp = cv2.morphologyEx(comp, cv2.MORPH_CLOSE, k, iterations=2)
-        masks.append(("bright", comp))
-
-    # Edges
-    edges = cv2.Canny(gray, 40, 140)
-    k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    edges = cv2.dilate(edges, k2, iterations=2)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k2, iterations=2)
-    masks.append(("edges", edges))
-
-    return masks
-
-
-# -----------------------------
-# Candidate scoring
-# -----------------------------
-def score_candidate(quad, img_shape, contour_area):
-    h, w = img_shape[:2]
-    rect = order_points(quad)
-    tl, tr, br, bl = rect
-
-    width = max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl))
-    height = max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))
-
-    if width < 100 or height < 100:
-        return -1e9
-
-    box_area = cv2.contourArea(rect.reshape(-1, 1, 2))
-    if box_area <= 1:
-        return -1e9
-
-    area_ratio = box_area / (h * w)
-    if area_ratio < 0.20 or area_ratio > 0.98:
-        return -1e9
-
-    aspect = max(width, height) / max(1.0, min(width, height))
-    a4_ratio = 1.414
-    aspect_score = max(0.0, 1.0 - abs(aspect - a4_ratio) / 0.8)
-
-    center = rect.mean(axis=0)
-    img_center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
-    center_dist = np.linalg.norm(center - img_center) / np.linalg.norm(img_center)
-    center_score = max(0.0, 1.0 - center_dist)
-
-    fill_ratio = float(np.clip(contour_area / box_area, 0.0, 1.2))
-
-    margin = min(
-        rect[:, 0].min(),
-        rect[:, 1].min(),
-        (w - 1) - rect[:, 0].max(),
-        (h - 1) - rect[:, 1].max(),
-    )
-    margin_score = float(np.clip((margin + 20) / 120.0, 0.0, 1.0))
-
-    score = (
-        area_ratio * 95.0
-        + aspect_score * 22.0
-        + center_score * 8.0
-        + margin_score * 4.0
-        + fill_ratio * 40.0
-    )
-
-    return score
-
-
-# -----------------------------
-# Auto detection
-# -----------------------------
-def detect_document_auto(original):
-    if original.shape[0] > 1400:
-        resize_ratio = original.shape[0] / 1400.0
-        image = cv2.resize(original, (int(original.shape[1] / resize_ratio), 1400))
-    else:
-        resize_ratio = 1.0
-        image = original.copy()
-
-    masks = build_candidate_masks(image)
-
-    best_quad = None
-    best_score = -1e9
-    best_source = None
-    best_fill_ratio = 1.0
-
-    img_area = image.shape[0] * image.shape[1]
-
-    for source_name, candidate_mask in masks:
-        contours = cv2.findContours(
-            candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        contours = contours[0] if len(contours) == 2 else contours[1]
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:12]
-
-        for c in contours:
-            contour_area = cv2.contourArea(c)
-            if contour_area < 0.05 * img_area:
-                continue
-
-            quad = contour_to_quad(c)
-            score = score_candidate(quad, image.shape, contour_area)
-
-            if score > best_score:
-                box_area = cv2.contourArea(order_points(quad).reshape(-1, 1, 2))
-                fill_ratio = float(np.clip(contour_area / max(box_area, 1.0), 0.0, 1.2))
-
-                best_score = score
-                best_quad = quad
-                best_source = source_name
-                best_fill_ratio = min(fill_ratio, 1.0)
-
-    if best_quad is None:
-        raise ValueError("Could not detect the document correctly.")
-
-    best_quad = best_quad * resize_ratio
-
-    expansion = 1.0 + 0.55 * (1.0 - best_fill_ratio)
-    if best_source == "edges":
-        expansion += 0.02
-
-    expansion = float(np.clip(expansion, 1.00, 1.18))
-    best_quad = expand_quad(best_quad, expansion, original.shape)
-
-    warped = four_point_transform(original, best_quad)
-    warped = trim_black_frame(warped)
-    return warped
-
-
-# -----------------------------
-# Manual mode helpers
-# -----------------------------
-def make_preview_for_clicks(image, max_width=1000, max_height=1400):
-    h, w = image.shape[:2]
-    scale = min(max_width / w, max_height / h, 1.0)
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-    return rgb, scale
-
-
-def draw_points_on_preview(preview_rgb, points_preview, radius=8):
-    canvas = preview_rgb.copy()
-
-    for idx, (x, y) in enumerate(points_preview):
-        cv2.circle(canvas, (int(x), int(y)), radius, (255, 0, 0), -1)
-        cv2.putText(
-            canvas,
-            str(idx + 1),
-            (int(x) + 10, int(y) - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 0, 0),
-            2,
-            cv2.LINE_AA
-        )
-    return canvas
-
-
-def detect_document_manual(original, points_original):
-    pts = np.array(points_original, dtype=np.float32)
-    warped = four_point_transform(original, pts)
-    warped = trim_black_frame(warped)
-    return warped
-
-
-# -----------------------------
-# Post-processing
-# -----------------------------
-def trim_black_frame(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 6, 255, cv2.THRESH_BINARY)
-    coords = cv2.findNonZero(mask)
-
-    if coords is None:
-        return image
-
-    x, y, w, h = cv2.boundingRect(coords)
-    return image[y:y + h, x:x + w]
-
-
-def decode_uploaded_image(file_bytes):
-    file_array = np.asarray(bytearray(file_bytes), dtype=np.uint8)
-    img = cv2.imdecode(file_array, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Could not read the uploaded image.")
-    return img
-
-
-def image_to_download_bytes(image_bgr, filename="final_result.png"):
-    success, buffer = cv2.imencode(".png", image_bgr)
-    if not success:
-        return None
-    return buffer.tobytes()
-
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="A4 Document Scanner, Method Cpp", page_icon="📄", layout="wide")
-
-st.markdown("""
-<style>
-    .stApp {
-        background: linear-gradient(180deg, #f8fafc 0%, #eef4ff 100%);
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <opencv2/opencv.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace py = pybind11;
+
+namespace {
+
+cv::Mat numpy_to_bgr_mat(const py::array &input) {
+    auto arr = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>(input);
+    py::buffer_info info = arr.request();
+
+    if (info.ndim != 3 || info.shape[2] != 3) {
+        throw std::runtime_error("Input image must be a uint8 NumPy array with shape (H, W, 3).");
     }
-    .block-container {
-        padding-top: 1.6rem;
-        padding-bottom: 2rem;
-        max-width: 1200px;
-    }
-    .hero-box {
-        background: rgba(255,255,255,0.92);
-        border: 1px solid rgba(59,130,246,0.16);
-        border-radius: 22px;
-        padding: 1.3rem 1.4rem;
-        box-shadow: 0 12px 30px rgba(15,23,42,0.08);
-        margin-bottom: 1rem;
-        backdrop-filter: blur(6px);
-    }
-    .hero-title {
-        font-size: 2rem;
-        font-weight: 800;
-        color: #0f172a;
-        margin-bottom: .35rem;
-        letter-spacing: -0.02em;
-    }
-    .hero-subtitle {
-        font-size: 1rem;
-        color: #475569;
-        line-height: 1.65;
-        margin-bottom: 0;
-    }
-    .section-card {
-        background: rgba(255,255,255,0.94);
-        border: 1px solid rgba(59,130,246,0.14);
-        border-radius: 20px;
-        padding: 1rem 1rem 0.8rem 1rem;
-        box-shadow: 0 12px 28px rgba(15,23,42,0.06);
-        margin-bottom: 1rem;
-    }
-    .section-title {
-        font-size: 1.05rem;
-        font-weight: 800;
-        color: #0f172a;
-        margin-bottom: .2rem;
-    }
-    .section-note {
-        font-size: .95rem;
-        color: #475569;
-        margin-bottom: .65rem;
-    }
-    .stButton > button {
-        border-radius: 14px !important;
-        border: none !important;
-        min-height: 3rem;
-        font-weight: 800 !important;
-        color: #ffffff !important;
-        background: linear-gradient(135deg, #1d4ed8 0%, #2563eb 100%) !important;
-        box-shadow: 0 10px 24px rgba(37,99,235,0.28) !important;
-        transition: all .2s ease;
-    }
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 14px 30px rgba(37,99,235,0.34) !important;
-        filter: brightness(1.03);
-    }
-    .stButton > button:focus,
-    .stDownloadButton > button:focus,
-    div[data-baseweb="select"] *:focus {
-        outline: 3px solid rgba(59,130,246,0.25) !important;
-        outline-offset: 2px !important;
-    }
-    .stDownloadButton > button {
-        border-radius: 14px !important;
-        border: none !important;
-        min-height: 3rem;
-        font-weight: 800 !important;
-        color: #ffffff !important;
-        background: linear-gradient(135deg, #059669 0%, #10b981 100%) !important;
-        box-shadow: 0 10px 24px rgba(16,185,129,0.28) !important;
-        transition: all .2s ease;
-    }
-    .stDownloadButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 14px 30px rgba(16,185,129,0.34) !important;
-        filter: brightness(1.03);
-    }
-    .stFileUploader, .stRadio {
-        background: rgba(255,255,255,0.82);
-        border-radius: 16px;
-        padding: .4rem .55rem;
-    }
-    .stRadio [role="radiogroup"] {
-        gap: 0.75rem;
-        padding-top: 0.2rem;
-    }
-    .stRadio [role="radiogroup"] label {
-        background: linear-gradient(135deg, #ede9fe 0%, #dbeafe 100%);
-        border: 1px solid #a5b4fc;
-        border-radius: 14px;
-        padding: 0.45rem 0.95rem;
-        box-shadow: 0 6px 14px rgba(79,70,229,0.12);
-    }
-    .stRadio [role="radiogroup"] label p {
-        color: #312e81;
-        font-weight: 800;
-    }
-    div[data-testid="stSelectbox"] {
-        background: linear-gradient(135deg, rgba(255,247,237,0.98) 0%, rgba(254,242,242,0.98) 100%);
-        border: 1px solid #fdba74;
-        border-radius: 18px;
-        padding: 0.6rem 0.7rem 0.75rem 0.7rem;
-        box-shadow: 0 10px 22px rgba(249,115,22,0.12);
-        margin-bottom: 0.9rem;
-    }
-    div[data-testid="stSelectbox"] label,
-    div[data-testid="stSelectbox"] label p {
-        color: #9a3412 !important;
-        font-weight: 800 !important;
-        font-size: 1rem !important;
-    }
-    div[data-testid="stSelectbox"] > div[data-baseweb="select"] {
-        background: rgba(255,255,255,0.92) !important;
-        border: 2px solid #fb923c !important;
-        border-radius: 14px !important;
-        box-shadow: 0 4px 14px rgba(249,115,22,0.10);
-    }
-    div[data-testid="stSelectbox"] div[data-baseweb="select"] > div {
-        color: #0f172a !important;
-        font-weight: 700 !important;
-    }
-    .footer-signature {
-        text-align: center;
-        margin-top: 2.2rem;
-        padding-top: 0.8rem;
-        color: #64748b;
-        font-size: 0.72rem;
-        font-weight: 600;
-        opacity: 0.95;
-    }
-    .stFileUploader {
-        border: 2px dashed #38bdf8;
-        background: linear-gradient(135deg, rgba(224,242,254,0.9) 0%, rgba(240,249,255,0.96) 100%);
-        box-shadow: 0 8px 22px rgba(14,165,233,0.10);
-    }
-    .stFileUploader label {
-        color: #0f172a !important;
-        font-weight: 800;
-    }
-    .stFileUploader section[data-testid="stFileUploaderDropzone"] {
-        background: transparent;
-        border: none;
-    }
-    .stFileUploader section[data-testid="stFileUploaderDropzone"] button {
-        background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%) !important;
-        color: white !important;
-        border: none !important;
-        border-radius: 12px !important;
-        font-weight: 800 !important;
-        box-shadow: 0 10px 22px rgba(37,99,235,0.22);
-    }
-    .stFileUploader section[data-testid="stFileUploaderDropzone"] button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 14px 28px rgba(37,99,235,0.28);
-    }
-    div[data-testid="stImage"] img {
-        border-radius: 16px;
-        box-shadow: 0 8px 24px rgba(15,23,42,0.08);
-    }
-    .result-label {
-        display: inline-block;
-        padding: .36rem .75rem;
-        border-radius: 999px;
-        background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
-        color: #1d4ed8;
-        font-size: .84rem;
-        font-weight: 800;
-        margin-bottom: .55rem;
-        border: 1px solid #93c5fd;
-    }
-</style>
-""", unsafe_allow_html=True)
 
-st.markdown("""
-<div class="hero-box">
-    <div class="hero-title">📄 A4 Document Scanner, Method Cpp</div>
-    <p class="hero-subtitle">
-        Upload an image of an A4 document. Use the default automatic mode or manually adjust the corners for a more accurate crop.
-    </p>
-</div>
-""", unsafe_allow_html=True)
+    cv::Mat mat(static_cast<int>(info.shape[0]), static_cast<int>(info.shape[1]), CV_8UC3, info.ptr);
+    return mat.clone();
+}
 
-st.markdown('<div class="section-card">', unsafe_allow_html=True)
-st.markdown('<div class="section-title">Scanner Settings</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-note">Choose the mode and upload one or more images.</div>', unsafe_allow_html=True)
+py::array_t<uint8_t> mat_to_numpy(const cv::Mat &image) {
+    if (image.empty()) {
+        throw std::runtime_error("Output image is empty.");
+    }
 
-mode = st.radio("Mode", ["Automatic", "Manual"], horizontal=True)
+    if (image.type() != CV_8UC3) {
+        throw std::runtime_error("Output image must be CV_8UC3.");
+    }
 
-uploaded_files = st.file_uploader(
-    "Upload image",
-    type=["jpg", "jpeg", "png", "bmp", "webp"],
-    accept_multiple_files=True
-)
+    cv::Mat continuous = image.isContinuous() ? image : image.clone();
+    auto out = py::array_t<uint8_t>({continuous.rows, continuous.cols, 3});
+    py::buffer_info out_info = out.request();
+    std::memcpy(out_info.ptr, continuous.data, static_cast<size_t>(continuous.total() * continuous.elemSize()));
+    return out;
+}
 
-st.markdown('</div>', unsafe_allow_html=True)
+std::array<cv::Point2f, 4> order_points(const std::vector<cv::Point2f> &pts) {
+    if (pts.size() != 4) {
+        throw std::runtime_error("Exactly 4 points are required.");
+    }
 
-if "manual_points_preview" not in st.session_state:
-    st.session_state.manual_points_preview = []
+    std::array<cv::Point2f, 4> rect;
+    std::array<float, 4> sums{};
+    std::array<float, 4> diffs{};
 
-if "manual_points_original" not in st.session_state:
-    st.session_state.manual_points_original = []
+    for (size_t i = 0; i < 4; ++i) {
+        sums[i] = pts[i].x + pts[i].y;
+        diffs[i] = pts[i].x - pts[i].y;
+    }
 
-if "last_click" not in st.session_state:
-    st.session_state.last_click = None
+    auto sum_min = static_cast<size_t>(std::min_element(sums.begin(), sums.end()) - sums.begin());
+    auto sum_max = static_cast<size_t>(std::max_element(sums.begin(), sums.end()) - sums.begin());
+    auto diff_min = static_cast<size_t>(std::min_element(diffs.begin(), diffs.end()) - diffs.begin());
+    auto diff_max = static_cast<size_t>(std::max_element(diffs.begin(), diffs.end()) - diffs.begin());
 
-if "last_uploaded_key" not in st.session_state:
-    st.session_state.last_uploaded_key = None
+    rect[0] = pts[sum_min];   // top-left
+    rect[2] = pts[sum_max];   // bottom-right
+    rect[1] = pts[diff_min];  // top-right
+    rect[3] = pts[diff_max];  // bottom-left
 
-if uploaded_files:
-    if mode == "Automatic":
-        for file_index, uploaded_file in enumerate(uploaded_files):
-            st.markdown('<div class="section-card">', unsafe_allow_html=True)
-            st.markdown('<div class="result-label">AUTOMATIC RESULT</div>', unsafe_allow_html=True)
-            st.subheader(f"{uploaded_file.name}")
+    return rect;
+}
 
-            file_bytes = uploaded_file.getvalue()
-            original = decode_uploaded_image(file_bytes)
+cv::Mat four_point_transform(const cv::Mat &image, const std::vector<cv::Point2f> &pts) {
+    auto rect = order_points(pts);
+    const auto &tl = rect[0];
+    const auto &tr = rect[1];
+    const auto &br = rect[2];
+    const auto &bl = rect[3];
 
-            try:
-                result = detect_document_auto(original)
-                st.image(
-                    cv2.cvtColor(result, cv2.COLOR_BGR2RGB),
-                    caption="Final result",
-                    use_container_width=True
-                )
+    const double width_a = cv::norm(br - bl);
+    const double width_b = cv::norm(tr - tl);
+    const int max_width = std::max({static_cast<int>(width_a), static_cast<int>(width_b), 1});
 
-                download_bytes = image_to_download_bytes(result)
-                if download_bytes is not None:
-                    file_base = uploaded_file.name.rsplit(".", 1)[0]
-                    st.download_button(
-                        label="Download final result",
-                        data=download_bytes,
-                        file_name=f"{file_base}_final_result.png",
-                        mime="image/png",
-                        key=f"download_auto_{file_index}"
-                    )
+    const double height_a = cv::norm(tr - br);
+    const double height_b = cv::norm(tl - bl);
+    const int max_height = std::max({static_cast<int>(height_a), static_cast<int>(height_b), 1});
 
-            except Exception as e:
-                st.error(f"Error: {e}")
-            st.markdown('</div>', unsafe_allow_html=True)
+    std::vector<cv::Point2f> src = {tl, tr, br, bl};
+    std::vector<cv::Point2f> dst = {
+        {0.0f, 0.0f},
+        {static_cast<float>(max_width - 1), 0.0f},
+        {static_cast<float>(max_width - 1), static_cast<float>(max_height - 1)},
+        {0.0f, static_cast<float>(max_height - 1)},
+    };
 
-    else:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="result-label">MANUAL MODE</div>', unsafe_allow_html=True)
+    cv::Mat M = cv::getPerspectiveTransform(src, dst);
+    cv::Mat warped;
+    cv::warpPerspective(image, warped, M, cv::Size(max_width, max_height));
+    return warped;
+}
 
-        selected_file_name = st.selectbox(
-            "Select an image for manual mode",
-            [file.name for file in uploaded_files]
-        )
+std::vector<cv::Point2f> expand_quad(const std::vector<cv::Point2f> &pts, float scale, const cv::Size &size) {
+    std::vector<cv::Point2f> expanded = pts;
+    cv::Point2f center(0.0f, 0.0f);
+    for (const auto &p : pts) {
+        center += p;
+    }
+    center *= 0.25f;
 
-        uploaded_file = next(
-            file for file in uploaded_files if file.name == selected_file_name
-        )
+    for (auto &p : expanded) {
+        p = center + (p - center) * scale;
+        p.x = std::clamp(p.x, 0.0f, static_cast<float>(size.width - 1));
+        p.y = std::clamp(p.y, 0.0f, static_cast<float>(size.height - 1));
+    }
 
-        upload_key = f"{uploaded_file.name}_{uploaded_file.size}"
+    return expanded;
+}
 
-        if st.session_state.last_uploaded_key != upload_key:
-            st.session_state.manual_points_preview = []
-            st.session_state.manual_points_original = []
-            st.session_state.last_click = None
-            st.session_state.last_uploaded_key = upload_key
+std::vector<cv::Point2f> contour_to_quad(const std::vector<cv::Point> &contour) {
+    std::vector<cv::Point> hull;
+    cv::convexHull(contour, hull);
+    double peri = cv::arcLength(hull, true);
 
-        file_bytes = uploaded_file.getvalue()
-        original = decode_uploaded_image(file_bytes)
+    for (double eps : {0.02, 0.03, 0.04, 0.05, 0.06}) {
+        std::vector<cv::Point> approx;
+        cv::approxPolyDP(hull, approx, eps * peri, true);
+        if (approx.size() == 4) {
+            std::vector<cv::Point2f> quad;
+            quad.reserve(4);
+            for (const auto &p : approx) {
+                quad.emplace_back(static_cast<float>(p.x), static_cast<float>(p.y));
+            }
+            return quad;
+        }
+    }
 
-        preview_rgb, preview_scale = make_preview_for_clicks(
+    cv::RotatedRect rect = cv::minAreaRect(hull);
+    cv::Point2f box[4];
+    rect.points(box);
+    return {box[0], box[1], box[2], box[3]};
+}
+
+cv::Mat clear_border_connected(const cv::Mat &mask) {
+    cv::Mat cleaned = mask.clone();
+    const int h = cleaned.rows;
+    const int w = cleaned.cols;
+
+    for (int x = 0; x < w; ++x) {
+        if (cleaned.at<uint8_t>(0, x) == 255) {
+            cv::Mat flood_mask = cv::Mat::zeros(h + 2, w + 2, CV_8U);
+            cv::floodFill(cleaned, flood_mask, cv::Point(x, 0), cv::Scalar(0));
+        }
+        if (cleaned.at<uint8_t>(h - 1, x) == 255) {
+            cv::Mat flood_mask = cv::Mat::zeros(h + 2, w + 2, CV_8U);
+            cv::floodFill(cleaned, flood_mask, cv::Point(x, h - 1), cv::Scalar(0));
+        }
+    }
+
+    for (int y = 0; y < h; ++y) {
+        if (cleaned.at<uint8_t>(y, 0) == 255) {
+            cv::Mat flood_mask = cv::Mat::zeros(h + 2, w + 2, CV_8U);
+            cv::floodFill(cleaned, flood_mask, cv::Point(0, y), cv::Scalar(0));
+        }
+        if (cleaned.at<uint8_t>(y, w - 1) == 255) {
+            cv::Mat flood_mask = cv::Mat::zeros(h + 2, w + 2, CV_8U);
+            cv::floodFill(cleaned, flood_mask, cv::Point(w - 1, y), cv::Scalar(0));
+        }
+    }
+
+    return cleaned;
+}
+
+cv::Mat largest_non_border_component(const cv::Mat &binary_mask, double min_area_ratio = 0.05) {
+    const int h = binary_mask.rows;
+    const int w = binary_mask.cols;
+
+    cv::Mat labels, stats, centroids;
+    int num_labels = cv::connectedComponentsWithStats(binary_mask, labels, stats, centroids, 8);
+
+    int best_idx = -1;
+    int best_area = 0;
+    double min_area = min_area_ratio * static_cast<double>(h * w);
+
+    for (int i = 1; i < num_labels; ++i) {
+        int x = stats.at<int>(i, cv::CC_STAT_LEFT);
+        int y = stats.at<int>(i, cv::CC_STAT_TOP);
+        int ww = stats.at<int>(i, cv::CC_STAT_WIDTH);
+        int hh = stats.at<int>(i, cv::CC_STAT_HEIGHT);
+        int area = stats.at<int>(i, cv::CC_STAT_AREA);
+
+        if (area < min_area) {
+            continue;
+        }
+        if (x <= 1 || y <= 1 || x + ww >= w - 1 || y + hh >= h - 1) {
+            continue;
+        }
+        if (area > best_area) {
+            best_area = area;
+            best_idx = i;
+        }
+    }
+
+    if (best_idx < 0) {
+        return cv::Mat();
+    }
+
+    cv::Mat comp = cv::Mat::zeros(binary_mask.size(), CV_8U);
+    comp.setTo(255, labels == best_idx);
+    return comp;
+}
+
+std::vector<std::pair<std::string, cv::Mat>> build_candidate_masks(const cv::Mat &image) {
+    std::vector<std::pair<std::string, cv::Mat>> masks;
+
+    cv::Mat gray;
+    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
+
+    auto clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    cv::Mat gray_eq;
+    clahe->apply(gray, gray_eq);
+
+    const int h = gray.rows;
+    const int w = gray.cols;
+
+    try {
+        cv::Mat gc_mask(image.size(), CV_8U, cv::Scalar(cv::GC_BGD));
+        cv::Rect rect(
+            static_cast<int>(w * 0.06),
+            static_cast<int>(h * 0.04),
+            static_cast<int>(w * 0.88),
+            static_cast<int>(h * 0.92));
+        cv::Mat bgd_model, fgd_model;
+        cv::grabCut(image, gc_mask, rect, bgd_model, fgd_model, 4, cv::GC_INIT_WITH_RECT);
+
+        cv::Mat grabcut = (gc_mask == cv::GC_FGD) | (gc_mask == cv::GC_PR_FGD);
+        grabcut.convertTo(grabcut, CV_8U, 255.0);
+
+        cv::Mat k = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 9));
+        cv::morphologyEx(grabcut, grabcut, cv::MORPH_CLOSE, k, cv::Point(-1, -1), 2);
+        masks.emplace_back("grabcut", grabcut);
+    } catch (...) {
+    }
+
+    cv::Mat bright;
+    cv::threshold(gray_eq, bright, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    bright = clear_border_connected(bright);
+
+    cv::Mat k = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(7, 7));
+    cv::erode(bright, bright, k, cv::Point(-1, -1), 2);
+
+    cv::Mat comp = largest_non_border_component(bright, 0.05);
+    if (!comp.empty()) {
+        cv::dilate(comp, comp, k, cv::Point(-1, -1), 2);
+        cv::morphologyEx(comp, comp, cv::MORPH_CLOSE, k, cv::Point(-1, -1), 2);
+        masks.emplace_back("bright", comp);
+    }
+
+    cv::Mat edges;
+    cv::Canny(gray, edges, 40, 140);
+    cv::Mat k2 = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+    cv::dilate(edges, edges, k2, cv::Point(-1, -1), 2);
+    cv::morphologyEx(edges, edges, cv::MORPH_CLOSE, k2, cv::Point(-1, -1), 2);
+    masks.emplace_back("edges", edges);
+
+    return masks;
+}
+
+double score_candidate(const std::vector<cv::Point2f> &quad, const cv::Size &size, double contour_area) {
+    const int h = size.height;
+    const int w = size.width;
+    auto rect = order_points(quad);
+
+    double width = std::max(cv::norm(rect[1] - rect[0]), cv::norm(rect[2] - rect[3]));
+    double height = std::max(cv::norm(rect[3] - rect[0]), cv::norm(rect[2] - rect[1]));
+
+    if (width < 100.0 || height < 100.0) {
+        return -1e9;
+    }
+
+    std::vector<cv::Point2f> rect_vec = {rect[0], rect[1], rect[2], rect[3]};
+    double box_area = std::abs(cv::contourArea(rect_vec));
+    if (box_area <= 1.0) {
+        return -1e9;
+    }
+
+    double area_ratio = box_area / static_cast<double>(h * w);
+    if (area_ratio < 0.20 || area_ratio > 0.98) {
+        return -1e9;
+    }
+
+    double aspect = std::max(width, height) / std::max(1.0, std::min(width, height));
+    constexpr double a4_ratio = 1.414;
+    double aspect_score = std::max(0.0, 1.0 - std::abs(aspect - a4_ratio) / 0.8);
+
+    cv::Point2f center = (rect[0] + rect[1] + rect[2] + rect[3]) * 0.25f;
+    cv::Point2f img_center(static_cast<float>(w) / 2.0f, static_cast<float>(h) / 2.0f);
+    double center_dist = cv::norm(center - img_center) / cv::norm(img_center);
+    double center_score = std::max(0.0, 1.0 - center_dist);
+
+    double fill_ratio = std::clamp(contour_area / box_area, 0.0, 1.2);
+
+    double min_x = std::min({rect[0].x, rect[1].x, rect[2].x, rect[3].x});
+    double min_y = std::min({rect[0].y, rect[1].y, rect[2].y, rect[3].y});
+    double max_x = std::max({rect[0].x, rect[1].x, rect[2].x, rect[3].x});
+    double max_y = std::max({rect[0].y, rect[1].y, rect[2].y, rect[3].y});
+
+    double margin = std::min({
+        min_x,
+        min_y,
+        (w - 1.0) - max_x,
+        (h - 1.0) - max_y,
+    });
+    double margin_score = std::clamp((margin + 20.0) / 120.0, 0.0, 1.0);
+
+    return (
+        area_ratio * 95.0 +
+        aspect_score * 22.0 +
+        center_score * 8.0 +
+        margin_score * 4.0 +
+        fill_ratio * 40.0
+    );
+}
+
+cv::Mat trim_black_frame(const cv::Mat &image) {
+    cv::Mat gray;
+    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+
+    cv::Mat mask;
+    cv::threshold(gray, mask, 6, 255, cv::THRESH_BINARY);
+
+    std::vector<cv::Point> coords;
+    cv::findNonZero(mask, coords);
+    if (coords.empty()) {
+        return image.clone();
+    }
+
+    cv::Rect roi = cv::boundingRect(coords);
+    return image(roi).clone();
+}
+
+std::vector<cv::Point2f> points_from_numpy(const py::array &points_obj) {
+    auto pts_arr = py::array_t<float, py::array::c_style | py::array::forcecast>(points_obj);
+    py::buffer_info info = pts_arr.request();
+
+    if (info.ndim != 2 || info.shape[0] != 4 || info.shape[1] != 2) {
+        throw std::runtime_error("Points must have shape (4, 2).");
+    }
+
+    auto *ptr = static_cast<float *>(info.ptr);
+    std::vector<cv::Point2f> pts;
+    pts.reserve(4);
+    for (int i = 0; i < 4; ++i) {
+        pts.emplace_back(ptr[i * 2], ptr[i * 2 + 1]);
+    }
+    return pts;
+}
+
+cv::Mat warped = four_point_transform(original, best_quad);
+warped = trim_black_frame(warped); {
+    cv::Mat image;
+    double resize_ratio = 1.0;
+
+    if (original.rows > 1400) {
+        resize_ratio = static_cast<double>(original.rows) / 1400.0;
+        cv::resize(
             original,
-            max_width=1000,
-            max_height=1400
-        )
+            image,
+            cv::Size(static_cast<int>(original.cols / resize_ratio), 1400)
+        );
+    } else {
+        image = original.clone();
+    }
 
-        preview_with_points = draw_points_on_preview(
-            preview_rgb,
-            st.session_state.manual_points_preview
-        )
+    auto masks = build_candidate_masks(image);
 
-        col_btn1, col_btn2 = st.columns(2)
-        with col_btn1:
-            if st.button("Reset points"):
-                st.session_state.manual_points_preview = []
-                st.session_state.manual_points_original = []
-                st.session_state.last_click = None
-                st.rerun()
+    std::vector<cv::Point2f> best_quad;
+    double best_score = -1e9;
+    std::string best_source;
+    double best_fill_ratio = 1.0;
 
-        with col_btn2:
-            if st.button("Undo last point"):
-                if st.session_state.manual_points_preview:
-                    st.session_state.manual_points_preview.pop()
-                if st.session_state.manual_points_original:
-                    st.session_state.manual_points_original.pop()
-                st.session_state.last_click = None
-                st.rerun()
+    const double img_area = static_cast<double>(image.rows * image.cols);
 
-        st.subheader("Click on the 4 corners")
+    for (auto &entry : masks) {
+        const auto &source_name = entry.first;
+        const auto &candidate_mask = entry.second;
 
-        clicked = streamlit_image_coordinates(
-            preview_with_points,
-            key="manual_click_image"
-        )
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(candidate_mask.clone(), contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+        std::sort(contours.begin(), contours.end(), [](const auto &a, const auto &b) {
+            return cv::contourArea(a) > cv::contourArea(b);
+        });
+        if (contours.size() > 12) {
+            contours.resize(12);
+        }
 
-        if clicked is not None:
-            current_click = (clicked["x"], clicked["y"])
+        for (const auto &c : contours) {
+            double contour_area = cv::contourArea(c);
+            if (contour_area < 0.05 * img_area) {
+                continue;
+            }
 
-            if st.session_state.last_click != current_click:
-                if len(st.session_state.manual_points_preview) < 4:
-                    st.session_state.manual_points_preview.append(current_click)
+            auto quad = contour_to_quad(c);
+            double score = score_candidate(quad, image.size(), contour_area);
+            if (score > best_score) {
+                auto ordered = order_points(quad);
+                std::vector<cv::Point2f> ordered_vec = {ordered[0], ordered[1], ordered[2], ordered[3]};
+                double box_area = std::abs(cv::contourArea(ordered_vec));
+                double fill_ratio = std::clamp(contour_area / std::max(box_area, 1.0), 0.0, 1.2);
 
-                    ox = int(round(clicked["x"] / preview_scale))
-                    oy = int(round(clicked["y"] / preview_scale))
+                best_score = score;
+                best_quad = quad;
+                best_source = source_name;
+                best_fill_ratio = std::min(fill_ratio, 1.0);
+            }
+        }
+    }
 
-                    ox = max(0, min(ox, original.shape[1] - 1))
-                    oy = max(0, min(oy, original.shape[0] - 1))
+    if (best_quad.empty()) {
+        throw std::runtime_error("No se pudo detectar el documento correctamente.");
+    }
 
-                    st.session_state.manual_points_original.append((ox, oy))
+    for (auto &p : best_quad) {
+        p.x = static_cast<float>(p.x * resize_ratio);
+        p.y = static_cast<float>(p.y * resize_ratio);
+    }
 
-                st.session_state.last_click = current_click
-                st.rerun()
+    double expansion = 1.0 + 0.55 * (1.0 - best_fill_ratio);
+    if (best_source == "edges") {
+        expansion += 0.02;
+    }
+    expansion = std::clamp(expansion, 1.00, 1.18);
 
-        if len(st.session_state.manual_points_original) == 4:
-            try:
-                result = detect_document_manual(original, st.session_state.manual_points_original)
-                st.image(
-                    cv2.cvtColor(result, cv2.COLOR_BGR2RGB),
-                    caption="Manual result",
-                    use_container_width=True
-                )
+    best_quad = expand_quad(best_quad, static_cast<float>(expansion), original.size());
+    cv::Mat warped = four_point_transform(original, best_quad);
+    return trim_black_frame(warped);
+}
 
-                download_bytes = image_to_download_bytes(result)
-                if download_bytes is not None:
-                    file_base = uploaded_file.name.rsplit(".", 1)[0]
-                    st.download_button(
-                        label="Download final result",
-                        data=download_bytes,
-                        file_name=f"{file_base}_final_result.png",
-                        mime="image/png"
-                    )
+cv::Mat detect_document_manual_impl(const cv::Mat &original, const std::vector<cv::Point2f> &points) {
+    cv::Mat warped = four_point_transform(original, points);
+    return trim_black_frame(warped);
+}
 
-            except Exception as e:
-                st.error(f"Error: {e}")  
-st.markdown('<div class="footer-signature">By Alan Masoud</div>', unsafe_allow_html=True)
+}  // namespace
 
+py::array_t<uint8_t> detect_document_auto(const py::array &image_obj) {
+    cv::Mat image = numpy_to_bgr_mat(image_obj);
+    cv::Mat result = detect_document_auto_impl(image);
+    return mat_to_numpy(result);
+}
+
+py::array_t<uint8_t> detect_document_manual(const py::array &image_obj, const py::array &points_obj) {
+    cv::Mat image = numpy_to_bgr_mat(image_obj);
+    auto points = points_from_numpy(points_obj);
+    cv::Mat result = detect_document_manual_impl(image, points);
+    return mat_to_numpy(result);
+}
+
+PYBIND11_MODULE(docscanner_cpp, m) {
+    m.doc() = "C++ core for the A4 document scanner";
+    m.def("detect_document_auto", &detect_document_auto, "Automatic document detection and scan");
+    m.def("detect_document_manual", &detect_document_manual, "Manual document scan from 4 points");
+}
