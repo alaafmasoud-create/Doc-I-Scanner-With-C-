@@ -146,6 +146,8 @@ std::vector<cv::Point2f> contour_to_quad(const std::vector<cv::Point> &contour) 
             for (size_t i = 1; i < 4; ++i) {
                 if (cv::norm(approx[i] - approx[i - 1]) < 10.0) {
                     return contour_to_quad(contour);
+                If (cv::norm(approx[i] - approx[0]) < 10.0) {
+                    return contour_to_quad(contour);
                 }
             }   
             for (const auto &p : approx) {
