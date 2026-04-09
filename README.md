@@ -52,11 +52,9 @@ This version **needs to compile a C++ module** during the build process. For tha
 
 This approach is technically correct for using C++ inside Streamlit, but the most delicate part of deployment is compiling OpenCV C++ in the cloud. If the build on Streamlit becomes too heavy or fails because of system dependencies, the more stable alternative is to return to a 100% Python version for deployment and keep C++ for a native app or a separate backend.
 
-## Deployment on Streamlit Community Cloud
-
-Upload the entire project to GitHub and select `app.py` as the main file.
-## Live App
+## Test the app @ streamlit
 
 [Test the code here](https://6955966t4r.streamlit.app/)
 
+## Authior
 Built By Alan Masoud
