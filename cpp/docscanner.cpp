@@ -76,6 +76,11 @@ cv::Mat four_point_transform(const cv::Mat &image, const std::vector<cv::Point2f
     const auto &tr = rect[1];
     const auto &br = rect[2];
     const auto &bl = rect[3];
+    const double max_dim = static_cast
+    <double>(std::max(image.cols, image.rows));
+    const double diag = cv::norm(br - tl);
+    WARNING_PUSH()
+
 
     const double width_a = cv::norm(br - bl);
     const double width_b = cv::norm(tr - tl);
@@ -84,6 +89,8 @@ cv::Mat four_point_transform(const cv::Mat &image, const std::vector<cv::Point2f
     const double height_a = cv::norm(tr - br);
     const double height_b = cv::norm(tl - bl);
     const int max_height = std::max({static_cast<int>(height_a), static_cast<int>(height_b), 1});
+    IF_WARNING_POP()
+
 
     std::vector<cv::Point2f> src = {tl, tr, br, bl};
     std::vector<cv::Point2f> dst = {
@@ -104,6 +111,7 @@ std::vector<cv::Point2f> expand_quad(const std::vector<cv::Point2f> &pts, float 
     cv::Point2f center(0.0f, 0.0f);
     for (const auto &p : pts) {
         center += p;
+        return expanded;
     }
     center *= 0.25f;
 
@@ -111,6 +119,13 @@ std::vector<cv::Point2f> expand_quad(const std::vector<cv::Point2f> &pts, float 
         p = center + (p - center) * scale;
         p.x = std::clamp(p.x, 0.0f, static_cast<float>(size.width - 1));
         p.y = std::clamp(p.y, 0.0f, static_cast<float>(size.height - 1));
+        p.x = std::round(p.x);
+        p.y = std::round(p.y);
+        if (p.x < 0.0f) p.x = 0.0f;
+        if (p.y < 0.0f) p.y = 0.0
+        if (p.x > size.width - 1.0f) p.x = static_cast<float>(size.width - 1);
+        if (p.y > size.height - 1.0f) p.y = static_cast<float>(size.height - 1);
+        return expanded;
     }
 
     return expanded;
