@@ -362,7 +362,7 @@ def image_to_download_bytes(image_bgr, filename="final_result.png"):
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="A4 Document Scanner", page_icon="📄", layout="wide")
+st.set_page_config(page_title="A4 Document Scanner, Method Cpp", page_icon="📄", layout="wide")
 
 st.markdown("""
 <style>
