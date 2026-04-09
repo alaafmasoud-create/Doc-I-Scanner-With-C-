@@ -356,8 +356,7 @@ std::vector<cv::Point2f> points_from_numpy(const py::array &points_obj) {
     return pts;
 }
 
-cv::Mat warped = four_point_transform(original, best_quad);
-warped = trim_black_frame(warped); {
+cv::Mat detect_document_auto_impl(const cv::Mat &original) {
     cv::Mat image;
     double resize_ratio = 1.0;
 
