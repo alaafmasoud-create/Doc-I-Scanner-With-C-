@@ -549,7 +549,7 @@ st.markdown("""
 
 st.markdown("""
 <div class="hero-box">
-    <div class="hero-title">📄 A4 Document Scanner</div>
+    <div class="hero-title">📄 A4 Document Scanner, Method Cpp</div>
     <p class="hero-subtitle">
         Upload an image of an A4 document. Use the default automatic mode or manually adjust the corners for a more accurate crop.
     </p>
