@@ -275,7 +275,7 @@ def detect_document_auto(original):
                 best_fill_ratio = min(fill_ratio, 1.0)
 
     if best_quad is None:
-        raise ValueError("No se pudo detectar el documento correctamente.")
+        raise ValueError("Could not detect the document correctly.")
 
     best_quad = best_quad * resize_ratio
 
@@ -348,7 +348,7 @@ def decode_uploaded_image(file_bytes):
     file_array = np.asarray(bytearray(file_bytes), dtype=np.uint8)
     img = cv2.imdecode(file_array, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError("No se pudo leer la imagen subida.")
+        raise ValueError("Could not read the uploaded image.")
     return img
 
 
@@ -359,30 +359,10 @@ def image_to_download_bytes(image_bgr, filename="final_result.png"):
     return buffer.tobytes()
 
 
-def force_horizontal(image):
-    h, w = image.shape[:2]
-    if h > w:
-        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-    return image
-
-
-def apply_rotation(image, angle):
-    angle = angle % 360
-
-    if angle == 90:
-        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-    elif angle == 180:
-        return cv2.rotate(image, cv2.ROTATE_180)
-    elif angle == 270:
-        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-    return image
-
-
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="Escáner de Documentos A4", page_icon="📄", layout="wide")
+st.set_page_config(page_title="A4 Document Scanner", page_icon="📄", layout="wide")
 
 st.markdown("""
 <style>
@@ -569,21 +549,21 @@ st.markdown("""
 
 st.markdown("""
 <div class="hero-box">
-    <div class="hero-title">📄 Escáner de Documentos A4</div>
+    <div class="hero-title">📄 A4 Document Scanner</div>
     <p class="hero-subtitle">
-        Sube una imagen de un documento A4. Usa el modo automático predeterminado o ajusta manualmente las esquinas para un recorte más preciso.
+        Upload an image of an A4 document. Use the default automatic mode or manually adjust the corners for a more accurate crop.
     </p>
 </div>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="section-card">', unsafe_allow_html=True)
-st.markdown('<div class="section-title">Configuración del escáner</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-note">Elige el modo y sube una o varias imágenes.</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Scanner Settings</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-note">Choose the mode and upload one or more images.</div>', unsafe_allow_html=True)
 
-mode = st.radio("Modo", ["Automático", "Manual"], horizontal=True)
+mode = st.radio("Mode", ["Automatic", "Manual"], horizontal=True)
 
 uploaded_files = st.file_uploader(
-    "Subir imagen",
+    "Upload image",
     type=["jpg", "jpeg", "png", "bmp", "webp"],
     accept_multiple_files=True
 )
@@ -603,43 +583,20 @@ if "last_uploaded_key" not in st.session_state:
     st.session_state.last_uploaded_key = None
 
 if uploaded_files:
-    if mode == "Automático":
+    if mode == "Automatic":
         for file_index, uploaded_file in enumerate(uploaded_files):
             st.markdown('<div class="section-card">', unsafe_allow_html=True)
-            st.markdown('<div class="result-label">RESULTADO AUTOMÁTICO</div>', unsafe_allow_html=True)
+            st.markdown('<div class="result-label">AUTOMATIC RESULT</div>', unsafe_allow_html=True)
             st.subheader(f"{uploaded_file.name}")
 
             file_bytes = uploaded_file.getvalue()
             original = decode_uploaded_image(file_bytes)
 
-            file_state_key = f"auto_rotation_{uploaded_file.name}_{uploaded_file.size}"
-
-            if file_state_key not in st.session_state:
-                st.session_state[file_state_key] = 0
-
             try:
                 result = detect_document_auto(original)
-                result = force_horizontal(result)
-
-                col_r1, col_r2, col_r3 = st.columns(3)
-
-                with col_r1:
-                    if st.button("Girar 90°", key=f"rotate90_auto_{file_index}"):
-                        st.session_state[file_state_key] = (st.session_state[file_state_key] + 90) % 360
-
-                with col_r2:
-                    if st.button("Girar 180°", key=f"rotate180_auto_{file_index}"):
-                        st.session_state[file_state_key] = (st.session_state[file_state_key] + 180) % 360
-
-                with col_r3:
-                    if st.button("Restablecer orientación", key=f"reset_auto_{file_index}"):
-                        st.session_state[file_state_key] = 0
-
-                result = apply_rotation(result, st.session_state[file_state_key])
-
                 st.image(
                     cv2.cvtColor(result, cv2.COLOR_BGR2RGB),
-                    caption="Resultado final",
+                    caption="Final result",
                     use_container_width=True
                 )
 
@@ -647,7 +604,7 @@ if uploaded_files:
                 if download_bytes is not None:
                     file_base = uploaded_file.name.rsplit(".", 1)[0]
                     st.download_button(
-                        label="Descargar resultado final",
+                        label="Download final result",
                         data=download_bytes,
                         file_name=f"{file_base}_final_result.png",
                         mime="image/png",
@@ -656,15 +613,14 @@ if uploaded_files:
 
             except Exception as e:
                 st.error(f"Error: {e}")
-
             st.markdown('</div>', unsafe_allow_html=True)
 
     else:
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="result-label">MODO MANUAL</div>', unsafe_allow_html=True)
+        st.markdown('<div class="result-label">MANUAL MODE</div>', unsafe_allow_html=True)
 
         selected_file_name = st.selectbox(
-            "Selecciona una imagen para el modo manual",
+            "Select an image for manual mode",
             [file.name for file in uploaded_files]
         )
 
@@ -679,7 +635,6 @@ if uploaded_files:
             st.session_state.manual_points_original = []
             st.session_state.last_click = None
             st.session_state.last_uploaded_key = upload_key
-            st.session_state[f"manual_rotation_{uploaded_file.name}_{uploaded_file.size}"] = 0
 
         file_bytes = uploaded_file.getvalue()
         original = decode_uploaded_image(file_bytes)
@@ -697,14 +652,14 @@ if uploaded_files:
 
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
-            if st.button("Restablecer puntos"):
+            if st.button("Reset points"):
                 st.session_state.manual_points_preview = []
                 st.session_state.manual_points_original = []
                 st.session_state.last_click = None
                 st.rerun()
 
         with col_btn2:
-            if st.button("Deshacer el último punto"):
+            if st.button("Undo last point"):
                 if st.session_state.manual_points_preview:
                     st.session_state.manual_points_preview.pop()
                 if st.session_state.manual_points_original:
@@ -712,7 +667,7 @@ if uploaded_files:
                 st.session_state.last_click = None
                 st.rerun()
 
-        st.subheader("Haz clic en las 4 esquinas")
+        st.subheader("Click on the 4 corners")
 
         clicked = streamlit_image_coordinates(
             preview_with_points,
@@ -739,33 +694,10 @@ if uploaded_files:
 
         if len(st.session_state.manual_points_original) == 4:
             try:
-                manual_rotation_key = f"manual_rotation_{uploaded_file.name}_{uploaded_file.size}"
-
-                if manual_rotation_key not in st.session_state:
-                    st.session_state[manual_rotation_key] = 0
-
                 result = detect_document_manual(original, st.session_state.manual_points_original)
-                result = force_horizontal(result)
-
-                col_m1, col_m2, col_m3 = st.columns(3)
-
-                with col_m1:
-                    if st.button("Girar 90°", key="rotate90_manual"):
-                        st.session_state[manual_rotation_key] = (st.session_state[manual_rotation_key] + 90) % 360
-
-                with col_m2:
-                    if st.button("Girar 180°", key="rotate180_manual"):
-                        st.session_state[manual_rotation_key] = (st.session_state[manual_rotation_key] + 180) % 360
-
-                with col_m3:
-                    if st.button("Restablecer orientación", key="reset_manual"):
-                        st.session_state[manual_rotation_key] = 0
-
-                result = apply_rotation(result, st.session_state[manual_rotation_key])
-
                 st.image(
                     cv2.cvtColor(result, cv2.COLOR_BGR2RGB),
-                    caption="Resultado manual",
+                    caption="Manual result",
                     use_container_width=True
                 )
 
@@ -773,16 +705,13 @@ if uploaded_files:
                 if download_bytes is not None:
                     file_base = uploaded_file.name.rsplit(".", 1)[0]
                     st.download_button(
-                        label="Descargar resultado final",
+                        label="Download final result",
                         data=download_bytes,
                         file_name=f"{file_base}_final_result.png",
-                        mime="image/png",
-                        key="download_manual_result"
+                        mime="image/png"
                     )
 
             except Exception as e:
-                st.error(f"Error: {e}")
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
+                st.error(f"Error: {e}")  
 st.markdown('<div class="footer-signature">By Alan Masoud</div>', unsafe_allow_html=True)
+
