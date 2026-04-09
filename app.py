@@ -359,6 +359,19 @@ def image_to_download_bytes(image_bgr, filename="final_result.png"):
     return buffer.tobytes()
 
 
+def force_vertical(image):
+    h, w = image.shape[:2]
+    if w > h:
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    return image
+
+
+def apply_rotation_180(image, rotate_180=False):
+    if rotate_180:
+        return cv2.rotate(image, cv2.ROTATE_180)
+    return image
+
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -506,7 +519,7 @@ st.markdown("""
     }
     .stFileUploader {
         border: 2px dashed #38bdf8;
-        background: linear-gradient(135deg, rgba(224,242,254,0.9) 0%, rgba(240,249,255,0.96) 100%);
+        background: linear-gradient(135deg, rgba(224,242,254,0.90) 0%, rgba(240,249,255,0.96) 100%);
         box-shadow: 0 8px 22px rgba(14,165,233,0.10);
     }
     .stFileUploader label {
@@ -551,7 +564,7 @@ st.markdown("""
 <div class="hero-box">
     <div class="hero-title">📄 A4 Document Scanner</div>
     <p class="hero-subtitle">
-        Upload an image of an A4 document. Use the default automatic mode or manually adjust the corners for a more accurate crop.
+        Upload an image of an A4 document. The final result will be shown vertically by default. If it appears upside down, use the 180° rotation button.
     </p>
 </div>
 """, unsafe_allow_html=True)
@@ -592,8 +605,27 @@ if uploaded_files:
             file_bytes = uploaded_file.getvalue()
             original = decode_uploaded_image(file_bytes)
 
+            file_state_key = f"auto_rotate180_{uploaded_file.name}_{uploaded_file.size}"
+
+            if file_state_key not in st.session_state:
+                st.session_state[file_state_key] = False
+
             try:
                 result = detect_document_auto(original)
+                result = force_vertical(result)
+
+                col_r1, col_r2 = st.columns(2)
+
+                with col_r1:
+                    if st.button("Rotate 180°", key=f"rotate180_auto_{file_index}"):
+                        st.session_state[file_state_key] = not st.session_state[file_state_key]
+
+                with col_r2:
+                    if st.button("Reset orientation", key=f"reset_auto_{file_index}"):
+                        st.session_state[file_state_key] = False
+
+                result = apply_rotation_180(result, st.session_state[file_state_key])
+
                 st.image(
                     cv2.cvtColor(result, cv2.COLOR_BGR2RGB),
                     caption="Final result",
@@ -613,6 +645,7 @@ if uploaded_files:
 
             except Exception as e:
                 st.error(f"Error: {e}")
+
             st.markdown('</div>', unsafe_allow_html=True)
 
     else:
@@ -635,6 +668,7 @@ if uploaded_files:
             st.session_state.manual_points_original = []
             st.session_state.last_click = None
             st.session_state.last_uploaded_key = upload_key
+            st.session_state[f"manual_rotate180_{uploaded_file.name}_{uploaded_file.size}"] = False
 
         file_bytes = uploaded_file.getvalue()
         original = decode_uploaded_image(file_bytes)
@@ -694,7 +728,26 @@ if uploaded_files:
 
         if len(st.session_state.manual_points_original) == 4:
             try:
+                manual_rotation_key = f"manual_rotate180_{uploaded_file.name}_{uploaded_file.size}"
+
+                if manual_rotation_key not in st.session_state:
+                    st.session_state[manual_rotation_key] = False
+
                 result = detect_document_manual(original, st.session_state.manual_points_original)
+                result = force_vertical(result)
+
+                col_m1, col_m2 = st.columns(2)
+
+                with col_m1:
+                    if st.button("Rotate 180°", key="rotate180_manual"):
+                        st.session_state[manual_rotation_key] = not st.session_state[manual_rotation_key]
+
+                with col_m2:
+                    if st.button("Reset orientation", key="reset_manual"):
+                        st.session_state[manual_rotation_key] = False
+
+                result = apply_rotation_180(result, st.session_state[manual_rotation_key])
+
                 st.image(
                     cv2.cvtColor(result, cv2.COLOR_BGR2RGB),
                     caption="Manual result",
@@ -708,10 +761,13 @@ if uploaded_files:
                         label="Download final result",
                         data=download_bytes,
                         file_name=f"{file_base}_final_result.png",
-                        mime="image/png"
+                        mime="image/png",
+                        key="download_manual_result"
                     )
 
             except Exception as e:
-                st.error(f"Error: {e}")  
-st.markdown('<div class="footer-signature">By Alan Masoud</div>', unsafe_allow_html=True)
+                st.error(f"Error: {e}")
 
+        st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="footer-signature">By Alan Masoud</div>', unsafe_allow_html=True)
