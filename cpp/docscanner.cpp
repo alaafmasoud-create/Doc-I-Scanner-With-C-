@@ -475,3 +475,4 @@ PYBIND11_MODULE(docscanner_cpp, m) {
     m.def("detect_document_auto", &detect_document_auto, "Automatic document detection and scan");
     m.def("detect_document_manual", &detect_document_manual, "Manual document scan from 4 points");
 }
+ 
