@@ -142,6 +142,12 @@ std::vector<cv::Point2f> contour_to_quad(const std::vector<cv::Point> &contour) 
         if (approx.size() == 4) {
             std::vector<cv::Point2f> quad;
             quad.reserve(4);
+            quad.emplace_back(static_cast<float>(approx[0].x), static_cast<float>(approx[0].y));
+            for (size_t i = 1; i < 4; ++i) {
+                if (cv::norm(approx[i] - approx[i - 1]) < 10.0) {
+                    return contour_to_quad(contour);
+                }
+            }   
             for (const auto &p : approx) {
                 quad.emplace_back(static_cast<float>(p.x), static_cast<float>(p.y));
             }
@@ -475,4 +481,3 @@ PYBIND11_MODULE(docscanner_cpp, m) {
     m.def("detect_document_auto", &detect_document_auto, "Automatic document detection and scan");
     m.def("detect_document_manual", &detect_document_manual, "Manual document scan from 4 points");
 }
- 
