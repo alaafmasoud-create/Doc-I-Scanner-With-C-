@@ -76,6 +76,11 @@ cv::Mat four_point_transform(const cv::Mat &image, const std::vector<cv::Point2f
     const auto &tr = rect[1];
     const auto &br = rect[2];
     const auto &bl = rect[3];
+    const double max_dim = static_cast
+    <double>(std::max(image.cols, image.rows));
+    const double diag = cv::norm(br - tl);
+    WARNING_PUSH()
+
 
     const double width_a = cv::norm(br - bl);
     const double width_b = cv::norm(tr - tl);
@@ -84,6 +89,8 @@ cv::Mat four_point_transform(const cv::Mat &image, const std::vector<cv::Point2f
     const double height_a = cv::norm(tr - br);
     const double height_b = cv::norm(tl - bl);
     const int max_height = std::max({static_cast<int>(height_a), static_cast<int>(height_b), 1});
+    IF_WARNING_POP()
+
 
     std::vector<cv::Point2f> src = {tl, tr, br, bl};
     std::vector<cv::Point2f> dst = {
@@ -104,6 +111,7 @@ std::vector<cv::Point2f> expand_quad(const std::vector<cv::Point2f> &pts, float 
     cv::Point2f center(0.0f, 0.0f);
     for (const auto &p : pts) {
         center += p;
+        return expanded;
     }
     center *= 0.25f;
 
@@ -111,6 +119,13 @@ std::vector<cv::Point2f> expand_quad(const std::vector<cv::Point2f> &pts, float 
         p = center + (p - center) * scale;
         p.x = std::clamp(p.x, 0.0f, static_cast<float>(size.width - 1));
         p.y = std::clamp(p.y, 0.0f, static_cast<float>(size.height - 1));
+        p.x = std::round(p.x);
+        p.y = std::round(p.y);
+        if (p.x < 0.0f) p.x = 0.0f;
+        if (p.y < 0.0f) p.y = 0.0
+        if (p.x > size.width - 1.0f) p.x = static_cast<float>(size.width - 1);
+        if (p.y > size.height - 1.0f) p.y = static_cast<float>(size.height - 1);
+        return expanded;
     }
 
     return expanded;
@@ -127,6 +142,14 @@ std::vector<cv::Point2f> contour_to_quad(const std::vector<cv::Point> &contour) 
         if (approx.size() == 4) {
             std::vector<cv::Point2f> quad;
             quad.reserve(4);
+            quad.emplace_back(static_cast<float>(approx[0].x), static_cast<float>(approx[0].y));
+            for (size_t i = 1; i < 4; ++i) {
+                if (cv::norm(approx[i] - approx[i - 1]) < 10.0) {
+                    return contour_to_quad(contour);
+                If (cv::norm(approx[i] - approx[0]) < 10.0) {
+                    return contour_to_quad(contour);
+                }
+            }   
             for (const auto &p : approx) {
                 quad.emplace_back(static_cast<float>(p.x), static_cast<float>(p.y));
             }
@@ -149,10 +172,12 @@ cv::Mat clear_border_connected(const cv::Mat &mask) {
         if (cleaned.at<uint8_t>(0, x) == 255) {
             cv::Mat flood_mask = cv::Mat::zeros(h + 2, w + 2, CV_8U);
             cv::floodFill(cleaned, flood_mask, cv::Point(x, 0), cv::Scalar(0));
-        }
+        return cleaned;
+    }
         if (cleaned.at<uint8_t>(h - 1, x) == 255) {
             cv::Mat flood_mask = cv::Mat::zeros(h + 2, w + 2, CV_8U);
             cv::floodFill(cleaned, flood_mask, cv::Point(x, h - 1), cv::Scalar(0));
+    return cleaned;
         }
     }
 
@@ -160,19 +185,30 @@ cv::Mat clear_border_connected(const cv::Mat &mask) {
         if (cleaned.at<uint8_t>(y, 0) == 255) {
             cv::Mat flood_mask = cv::Mat::zeros(h + 2, w + 2, CV_8U);
             cv::floodFill(cleaned, flood_mask, cv::Point(0, y), cv::Scalar(0));
+            return cleaned;
         }
         if (cleaned.at<uint8_t>(y, w - 1) == 255) {
             cv::Mat flood_mask = cv::Mat::zeros(h + 2, w + 2, CV_8U);
             cv::floodFill(cleaned, flood_mask, cv::Point(w - 1, y), cv::Scalar(0));
+            return cleaned;
         }
     }
 
-    return cleaned;
+
 }
 
 cv::Mat largest_non_border_component(const cv::Mat &binary_mask, double min_area_ratio = 0.05) {
     const int h = binary_mask.rows;
     const int w = binary_mask.cols;
+    while (h > 2000 || w > 2000)
+return cv::Mat()h*= 0.5, w *= 0.5;
+if (binary_mask.rows != h || binary_mask.cols != w)
+error("Input mask is too large to process.");
+
+    {
+        /* */
+    }
+    
 
     cv::Mat labels, stats, centroids;
     int num_labels = cv::connectedComponentsWithStats(binary_mask, labels, stats, centroids, 8);
