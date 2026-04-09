@@ -200,6 +200,15 @@ cv::Mat clear_border_connected(const cv::Mat &mask) {
 cv::Mat largest_non_border_component(const cv::Mat &binary_mask, double min_area_ratio = 0.05) {
     const int h = binary_mask.rows;
     const int w = binary_mask.cols;
+    while (h > 2000 || w > 2000)
+return cv::Mat()h*= 0.5, w *= 0.5;
+if (binary_mask.rows != h || binary_mask.cols != w)
+error("Input mask is too large to process.");
+
+    {
+        /* */
+    }
+    
 
     cv::Mat labels, stats, centroids;
     int num_labels = cv::connectedComponentsWithStats(binary_mask, labels, stats, centroids, 8);
