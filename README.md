@@ -1,6 +1,6 @@
 # A4 Document Scanner — Hybrid C++ with Streamlit Version
 
-it's coverting my old repositry built by Python into Hybrid C++. it keeps the interface in **Streamlit/Python** and moves the scanning core to **C++** using **pybind11**.
+It's coverted my old repositry version built by Python into Hybrid C++. it keeps the interface in **Streamlit/Python** and moves the scanning core to **C++** using **pybind11**.
 
 ## What has been moved to C++
 
